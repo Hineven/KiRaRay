@@ -14,6 +14,9 @@
 #include "util/check.h"
 
 KRR_NAMESPACE_BEGIN
+// Define this macro to expand some recursive routines (e.g. DTreePDF, DTreeSample)
+// May achieve better performance.
+//#define PPG_DTREE_NONRECURSE
 
 using AtomicType = double;	/* The type used for storing atomic data, e.g., per-node irradiance. */
 
@@ -312,7 +315,22 @@ public:
 
 		   if (!isinf(irradiance) && irradiance > 0) {
 				if (directionalFilter == EDirectionalFilter::ENearest) {
+#ifndef PPG_DTREE_NONRECURSE
 					m_nodes[0].record(p, irradiance * statisticalWeight, m_nodes);
+#else
+					uint16_t curNode = 0;
+					while (true) {
+						QuadTreeNode &node = m_nodes[curNode];
+						int index		   = node.childIndex(p);
+
+						if (node.isLeaf(index)) {
+							float prevRadiance = node.m_sum[index].fetch_add((AtomicType) irradiance);
+							break;
+						} else {
+							curNode = node.child(index);
+						}
+					}
+#endif
 				} else {
 					int depth  = depthAt(p);
 					float size = pow(0.5f, depth);
@@ -331,10 +349,45 @@ public:
 		if (!(mean() > 0)) {
 			return M_INV_4PI;
 		}
+
+#ifndef PPG_DTREE_NONRECURSE
 		return m_nodes[0].pdf(p, m_nodes) * M_INV_4PI;
+#else
+		uint16_t curNode = 0;
+		float factor	 = 1;
+		while (true) {
+			const QuadTreeNode& node = m_nodes[curNode];
+			const int index			 = node.childIndex(p);
+			if (!(node.sum(index) > 0)) {
+				return 0;
+			}
+			factor *= 4.f * node.sum(index) 
+				/ (node.sum(0) + node.sum(1) + node.sum(2) + node.sum(3));
+			if (node.isLeaf(index)) {
+				break;
+			} else {
+				curNode = node.child(index);
+			}
+		}
+		return factor * M_INV_4PI;
+#endif
 	}
 
-	KRR_CALLABLE int depthAt(Vector2f p) const { return m_nodes[0].depthAt(p, m_nodes); }
+	KRR_CALLABLE int depthAt(Vector2f p) const { 
+#ifndef PPG_DTREE_NONRECURSE
+		return m_nodes[0].depthAt(p, m_nodes);
+#else
+		uint16_t curNode = 0, depth = 0;
+		while (true) {
+			depth++;
+			const QuadTreeNode& node = m_nodes[curNode];
+			const int index = node.childIndex(p);
+			if (node.isLeaf(index)) break;
+			else curNode = node.child(index);
+		}
+		return depth;
+#endif
+	}
 
 	KRR_CALLABLE int depth() const { return m_maxDepth; }
 
@@ -342,7 +395,62 @@ public:
 		if (!(mean() > 0)) { /* This d-tree has no radiance records. */
 			return sampler.get2D();
 		}
-		Vector2f res = m_nodes[0].sample(sampler, m_nodes);
+#ifndef PPG_DTREE_NONRECURSE
+		Vector2f res		= m_nodes[0].sample(sampler, m_nodes);
+#else
+		Vector2f origin		= Vector2f{0.0f, 0.0f}; /* x, y */
+		Vector2f res		= sampler.get2D();
+		uint16_t curNodeIdx = 0;
+		float areaFactor	= 1;
+		while (true) {
+			const QuadTreeNode &node = m_nodes[curNodeIdx];
+
+			int index = 0;
+
+			float topLeft  = node.sum(0);
+			float topRight = node.sum(1);
+			float partial  = topLeft + node.sum(2);
+			float total	   = partial + topRight + node.sum(3);
+
+			// Should only happen when there are numerical instabilities.
+			if (!(total > 0.0f)) {
+				res = sampler.get2D();
+				break;
+			}
+
+			float boundary	= partial / total;
+			float sample = sampler.get1D();
+
+			if (sample < boundary) {	/* whether sampled the left part (left -> x < 0.5) */
+				DCHECK(partial > 0);
+				sample /= boundary;				/* sample reuse */
+				boundary = topLeft / partial;	/* next check whether sampled the top left part */
+			} else {
+				partial = total - partial;		/* no, in the right part... */
+				DCHECK(partial > 0);
+				origin[0] += 0.5f * areaFactor;				/* move to the right part */
+				sample	  = (sample - boundary) / (1.0f - boundary);
+				boundary  = topRight / partial;
+				index |= 1 << 0;				/* the cell #1 or #3... */
+			}
+
+			if (sample < boundary) {
+				sample /= boundary;
+			} else {
+				origin[1] += 0.5f * areaFactor;
+				sample	  = (sample - boundary) / (1.0f - boundary);
+				index |= 1 << 1;
+			}
+
+			if (node.isLeaf(index)) {
+				res = origin + 0.5f * areaFactor * sampler.get2D();
+				break;
+			} else {
+				areaFactor *= 0.5;
+				curNodeIdx = node.child(index);
+			}
+		}
+#endif
 		return clamp(res, 0.f, 1.f);
 	}
 
